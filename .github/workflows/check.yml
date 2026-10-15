@@ -5,6 +5,13 @@ on:
     - cron: "*/10 * * * *"   # every 10 minutes (UTC)
   workflow_dispatch:          # adds a manual "Run workflow" button
 
+permissions:
+  contents: write             # lets the job save state.json back to the repo
+
+concurrency:
+  group: mamas-check          # never run two checks at once
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,3 +30,14 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+
+      - name: Save alert state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update alert state"
+            git push
+          fi
