@@ -2,7 +2,8 @@
 """
 One-shot availability check for Mama's Fish House (SevenRooms).
 Run on a schedule by GitHub Actions. Behavior:
-  - Slots found       -> Discord bot posts an alert
+  - Slots found       -> Discord alert (then quiet for that date for 24h,
+                          unless it goes unavailable and reopens)
   - Nothing found     -> silent
   - Errors            -> Discord bot posts an error alert (throttled to
                          ~once/hour on scheduled runs; always on manual runs)
@@ -28,10 +29,12 @@ import requests
 # ----------------------------- CONFIG ---------------------------------
 VENUE_SLUG = "mamasfishhouserestaurantinn"
 PARTY_SIZE = 6
-START_DATE = "2026-12-11"              # first day to check (YYYY-MM-DD)
-END_DATE = "2026-12-15"                # last day to check (inclusive)
+START_DATE = "2026-12-23"              # first day to check (YYYY-MM-DD)
+END_DATE = "2026-12-28"                # last day to check (inclusive)
 EARLIEST = "ALL"                       # "ALL" or a time like "16:30"
 LATEST = "ALL"                         # "ALL" or a time like "20:30"
+ALERT_COOLDOWN_HOURS = 24              # after alerting for a date, stay quiet for this long
+STATE_FILE = "state.json"              # remembers when each date was last alerted
 # -----------------------------------------------------------------------
 
 API = "https://www.sevenrooms.com/api-yoa/availability/ng/widget/range"
@@ -117,6 +120,27 @@ def notify(msg):
         print("Discord not configured; would have sent:\n" + msg)
 
 
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+
+
+def in_cooldown(state, day):
+    last = state.get(day)
+    if not last:
+        return False
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(last)
+    return age < timedelta(hours=ALERT_COOLDOWN_HOURS)
+
+
 def should_alert_errors():
     """Manual runs always alert. Scheduled runs alert only in the first
     10 minutes of each hour (UTC) so an outage doesn't spam every 10 min."""
@@ -132,25 +156,40 @@ def main():
 
     errors = []
     dates = list(date_range())
-    for day in dates:
-        time.sleep(1)  # be polite between requests
-        try:
-            data = fetch(day)
-            if "--debug" in sys.argv:
-                print(json.dumps(data)[:3000])
-            slots = sorted(set(s for s in find_slots(data) if in_window(s)))
-        except Exception as e:
-            print(f"{day}: ERROR {e}")
-            errors.append(f"{day}: {type(e).__name__}: {e}")
-            continue
+    state = load_state()
+    original_state = dict(state)
+    try:
+        for day in dates:
+            time.sleep(1)  # be polite between requests
+            try:
+                data = fetch(day)
+                if "--debug" in sys.argv:
+                    print(json.dumps(data)[:3000])
+                slots = sorted(set(s for s in find_slots(data) if in_window(s)))
+            except Exception as e:
+                print(f"{day}: ERROR {e}")
+                errors.append(f"{day}: {type(e).__name__}: {e}")
+                continue
 
-        print(f"{day}: {slots or 'nothing available'}")
-        if slots:
+            print(f"{day}: {slots or 'nothing available'}")
+            if not slots:
+                # Date is unavailable now; clear its cooldown so the next
+                # opening alerts immediately.
+                state.pop(day, None)
+                continue
+            if in_cooldown(state, day):
+                print(f"{day}: alert suppressed (already alerted within "
+                      f"{ALERT_COOLDOWN_HOURS}h)")
+                continue
             notify(
                 f"🐟 **Mama's Fish House opening!**\n"
                 f"{day} — {', '.join(slots)} (party of {PARTY_SIZE})\n"
                 f"https://www.sevenrooms.com/reservations/{VENUE_SLUG}"
             )
+            state[day] = datetime.now(timezone.utc).isoformat()
+    finally:
+        if state != original_state:
+            save_state(state)
 
     if errors and should_alert_errors():
         notify("⚠️ **Mama's watcher error**\n" + "\n".join(errors))
